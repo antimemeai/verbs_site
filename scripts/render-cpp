@@ -1,14 +1,88 @@
 #!/usr/bin/env python3
-"""Render a verbatim C++ seed source reference, not a C++ API parser."""
+"""Generate the current C++ API reference using Doxygen XML and house HTML."""
 import argparse
 import html
 from pathlib import Path
 import re
+import shutil
 import subprocess
-import sys
+import tempfile
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent.parent
 HEADER = "packages/cpp/include/verbs/verbs.hpp"
+
+
+def text(element):
+    return "" if element is None else "".join(element.itertext()).strip()
+
+
+def escape(value):
+    return html.escape(value, quote=True)
+
+
+def api_html(directory, revision):
+    sections = []
+    count = 0
+    index = ET.parse(directory / "index.xml")
+    compounds = sorted(index.findall("compound"),
+                       key=lambda c: (c.get("kind") != "namespace", c.findtext("name")))
+    for item in compounds:
+        kind, name = item.get("kind"), item.findtext("name", "")
+        if kind in {"dir", "file"}:
+            continue
+        if name != "verbs" and not name.startswith("verbs::"):
+            continue
+        if kind not in {"namespace", "class", "struct"}:
+            raise SystemExit("unhandled Doxygen compound: " + str(kind))
+        compound = ET.parse(directory / (item.get("refid") + ".xml")).find("compounddef")
+        members = [m for m in compound.findall("sectiondef/memberdef")
+                   if m.get("prot") == "public"]
+        if not members:
+            continue
+        sections.append('<section class="api-group"><h2>' + escape(kind + " " + name) + '</h2>')
+        bases = compound.findall("basecompoundref")
+        if bases:
+            declaration = kind + " " + name + " : " + ", ".join(
+                b.get("prot", "public") + " " + text(b) for b in bases)
+            sections.append('<pre class="signature"><code>' + escape(declaration) + '</code></pre>')
+        for member in members:
+            member_kind = member.get("kind")
+            if member_kind not in {"function", "variable"}:
+                # Extend deliberately as the implementation grows, rather than
+                # silently omitting an API kind this renderer cannot present.
+                raise SystemExit("unhandled Doxygen member: " + str(member_kind))
+            qualified = member.findtext("qualifiedname") or name + "::" + member.findtext("name")
+            signature = text(member.find("definition")) + text(member.find("argsstring"))
+            if member.get("explicit") == "yes":
+                signature = "explicit " + signature
+            parameters = []
+            for param in member.findall("templateparamlist/param"):
+                value = text(param.find("type"))
+                if param.find("declname") is not None:
+                    value += " " + text(param.find("declname"))
+                if param.find("defval") is not None:
+                    value += " = " + text(param.find("defval"))
+                parameters.append(value)
+            if parameters:
+                signature = "template <" + ", ".join(parameters) + ">\n" + signature
+            sections.append('<article class="api-member" id="' + escape(member.get("id")) + '">'
+                            '<h3><code>' + escape(qualified) + '</code></h3>'
+                            '<pre class="signature"><code>' + escape(signature) + ';</code></pre>')
+            for description in ["briefdescription", "detaileddescription"]:
+                for paragraph in member.findall(description + "/para"):
+                    sections.append('<p>' + escape(text(paragraph)) + '</p>')
+            location = member.find("location")
+            if location is not None and location.get("line", "").isdigit():
+                source = ("https://github.com/antimemeai/verbs/blob/" + revision
+                          + "/" + HEADER + "#L" + location.get("line"))
+                sections.append('<a class="source-link" href="' + escape(source) + '">source ↗</a>')
+            sections.append('</article>')
+            count += 1
+        sections.append('</section>')
+    if not count:
+        raise SystemExit("Doxygen extracted no public Verbs API")
+    return "\n".join(sections), count
 
 
 def main():
@@ -17,6 +91,9 @@ def main():
     parser.add_argument("--revision", default="origin/main")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    doxygen = shutil.which("doxygen")
+    if not doxygen:
+        raise SystemExit("Doxygen is required to generate/check docs: brew install doxygen")
 
     def git(*arguments):
         return subprocess.check_output(["git", "-C", str(args.repo), *arguments])
@@ -25,30 +102,43 @@ def main():
                    args.revision + "^{commit}").decode().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise SystemExit("expected a full SHA-1 source commit")
-    source = git("show", revision + ":" + HEADER).decode("utf-8")
+    source = git("show", revision + ":" + HEADER)
     license_text = git("show", revision + ":LICENSE")
+    version = subprocess.check_output([doxygen, "--version"], text=True).strip()
+    with tempfile.TemporaryDirectory(prefix="verbs-doxygen-") as temporary:
+        work = Path(temporary)
+        inputs, output = work / "include/verbs", work / "output"
+        inputs.mkdir(parents=True)
+        (inputs / "verbs.hpp").write_bytes(source)
+        quote = lambda path: '"' + str(path).replace('\\', '\\\\').replace('"', '\\"') + '"'
+        configuration = (ROOT / "Doxyfile").read_text()
+        configuration += "\nINPUT = " + quote(inputs) + "\nOUTPUT_DIRECTORY = " + quote(output) + "\n"
+        (work / "Doxyfile").write_text(configuration)
+        subprocess.run([doxygen, str(work / "Doxyfile")], cwd=work, check=True)
+        api, count = api_html(output / "xml", revision)
     template = (ROOT / "templates/cpp.html").read_text()
-    # Insert source last: source text must never be interpreted as template data.
     rendered = (template.replace("@@REVISION@@", revision)
                 .replace("@@SHORT_REVISION@@", revision[:12])
-                .replace("@@SOURCE@@", html.escape(source)))
+                .replace("@@DOXYGEN@@", escape(version))
+                .replace("@@API@@", api))
     outputs = {
         ROOT / "public/cpp/index.html": rendered.encode(),
         ROOT / "public/cpp/LICENSE.txt": license_text,
+        ROOT / "public/cpp/verbs.hpp": source,
     }
     if args.check:
         bad = [str(p.relative_to(ROOT)) for p, data in outputs.items()
                if not p.is_file() or p.read_bytes() != data]
         if bad:
-            raise SystemExit("stale C++ snapshot: " + ", ".join(bad))
-        print("C++ source and license match", revision)
+            raise SystemExit("stale C++ documentation: " + ", ".join(bad))
+        print("Doxygen API, source, and license match", revision)
     else:
+        # Nothing is published until extraction and rendering have succeeded.
         for path, data in outputs.items():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-        print("Rendered C++ source and license from", revision)
-    return 0
+        print("Rendered", count, "public members with Doxygen", version, "from", revision)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

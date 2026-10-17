@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the two static pages and their generated source snapshot."""
+"""Check the static pages and Doxygen-generated C++ reference."""
 from html.parser import HTMLParser
 from pathlib import Path
 import re
@@ -65,7 +65,18 @@ for relative in ["index.html", "cpp/index.html"]:
             "git", "-C", str(ROOT.parent / "verbs"), "show",
             revision + ":packages/cpp/include/verbs/verbs.hpp"
         ]).decode()
-        assert "".join(page.code) == source, "source view must be verbatim"
+        assert (PUBLIC / "cpp/verbs.hpp").read_text() == source, "header download must be verbatim"
+        api = "".join(page.code)
+        for declaration in [
+            "template <typename T, typename Predicate>",
+            "T verbs::check(std::string name, T value, Predicate &&predicate);",
+            "class verbs::violation : public std::runtime_error",
+            "const std::string verbs::violation::constraint;",
+            "explicit verbs::violation::violation(std::string name);",
+        ]:
+            assert declaration in api, declaration
+        assert text.count('class="api-member"') == 3, "seed API surface changed; inspect generated docs"
+        assert "Bounded" not in api, "do not expose design sketches as current API"
         subprocess.run([str(ROOT / "scripts/render-cpp"), "--check",
                         "--revision", revision], check=True)
 
@@ -73,4 +84,4 @@ css = (PUBLIC / "styles.css").read_text()
 for asset in re.findall(r'url\("(/[^\"]+)"\)', css):
     assert (PUBLIC / asset.lstrip("/")).is_file(), asset
 assert not re.search(r"(?:animation|transition)\s*:", css)
-print("Pages, local links, assets, unique IDs, no scripts/motion, and verbatim C++ snapshot OK.")
+print("Pages, local links, assets, unique IDs, no scripts/motion, and Doxygen seed API/source fidelity OK.")
